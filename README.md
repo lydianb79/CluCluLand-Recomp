@@ -1,66 +1,91 @@
-# Clu Clu Land Remastered (macOS · Metal)
+<p align="center">
+  <img src="Resources/AppIcon.png" width="160" alt="App icon">
+</p>
+
+<h1 align="center">Clu Clu Land Remastered</h1>
+
+<p align="center">
+  A native macOS app (Swift · Metal) that runs the original 1984 game code unchanged,<br>
+  with a modern 2026 renderer and remastered sound.
+</p>
 
 ![Classic vs Remastered](preview.png)
 
-A native macOS app that runs **your own Clu Clu Land ROM** (not included) unchanged and renders it with a
-modern Metal pipeline. The game logic is the original 1984 code; only the presentation is new.
+> **Bring your own ROM.** No game data is included in this repository. You need your own dump
+> of *Clu Clu Land* (`.nes`, iNES format). This project is not affiliated with or endorsed by Nintendo.
 
-## Build & run
+## Features
 
-Requirements: macOS 13 Ventura or newer, Xcode 15+ (or the Command Line Tools with Swift 5.9+).
+* **Original gameplay**: the game's own 6502 code runs on a cycle-counted NES core, so the
+  physics, timing and enemy behaviour are untouched.
+* **Remastered 2026 graphics**: resolution-independent pixel-art reconstruction, glossy surface
+  lighting, soft shadows, an animated deep-sea backdrop, bloom, filmic tonemapping and lens effects.
+* **Classic and CRT modes**: crisp pixels, or a CRT look with scanlines, aperture grille and curvature.
+* **Remastered 2026 sound and music**: the original score performed live by a modern stereo synth
+  with chorus and reverb. You can switch back to the authentic NES sound at any time.
+* **Configurable**: graphics, audio and input settings (keyboard and gamepad for 2 players), presets,
+  turbo buttons, save states and fast-forward.
+* **Native**: SwiftUI + MetalKit + AVAudioEngine + GameController, with no third-party dependencies.
+
+## Getting started
+
+**Requirements:** macOS 13 Ventura or newer, and Xcode 15+ or the Command Line Tools (Swift 5.9+).
 
 ```bash
-./build_app.sh                 # → build/Clu Clu Land Remastered.app
+# put the repo next to your ROM, e.g.
+#   CluCluLand/
+#   ├── Clu Clu Land.nes
+#   └── CluCluLand-Recomp/      ← this repo
+git clone https://github.com/lydianb79/CluCluLand-Recomp.git
+cd CluCluLand-Recomp
+./build_app.sh
 open "build/Clu Clu Land Remastered.app"
 ```
 
-* `UNIVERSAL=1 ./build_app.sh` builds an Apple-silicon + Intel binary.
-* `swift run` also works for quick iteration.
-* If `../Clu Clu Land.nes` exists, the script copies it into the app bundle. Otherwise the app
-  remembers the last ROM you opened. You can also drag a `.nes` file onto the window or use **File › Open ROM… (⌘O)**.
+* If `../Clu Clu Land.nes` exists, `build_app.sh` copies it into the app bundle.
+* Otherwise, use **File › Open ROM… (⌘O)** or drag the `.nes` file onto the window. The app
+  remembers the last ROM you opened.
+* `UNIVERSAL=1 ./build_app.sh` builds a universal binary (Apple silicon + Intel).
+* `swift run` works for quick iteration. The app then runs without a bundle, so there is no Dock icon.
 
-## How it works
+## Settings (⌘,)
 
-| Layer | What it does |
+### Graphics
+| Option | |
 |---|---|
-| `Sources/NESCore` (C) | Cycle-counted 6502 CPU, 2C02 PPU (scanline renderer with proper scrolling and sprite-0 hit), 2A03 APU (2 pulse, triangle, noise, DPCM, console-style filtering), NROM cartridge, controllers, save states. Besides the normal picture, the PPU exports **per-pixel colour layers** (background, sprites with priority, backdrop per scanline). |
-| `Renderer.swift` + `Shaders.swift` | Metal pipeline: height-map compute → resolution-independent reconstruction of the pixel art → lit scene → bloom chain → filmic composite. |
-| `GameSession.swift` | Frame pacing (locked to 60 Hz displays, accumulator otherwise), dynamic audio-rate control, save states, hotkeys. |
-| `Input.swift` | Keyboard and GameController input, live rebinding, turbo buttons. |
-| `SettingsView.swift` | Settings window (⌘,): Graphics, Controls, Audio. Everything persists automatically. |
+| Render mode | **Remastered (2026)**, **Classic Pixels** or **CRT** |
+| Presets | Remastered Ultra, Remastered Light, Classic, CRT (also in **Game › Graphics Preset**) |
+| Remastered | Reconstruction quality (up to 8× internal), edge rounding and sharpness, surface lighting, specular, rim light, shadows, light direction, background (Original / Deep Sea / Gradient), bubbles |
+| CRT | Scanlines, aperture grille, curvature |
+| Post-processing | Bloom (intensity, threshold), ACES tonemapping, exposure, saturation, contrast, vignette, chromatic aberration, film grain |
+| Display | 4:3 NTSC or square pixels, integer scaling, overscan crop, ambient-glow or black borders, render scale, V-Sync, FPS counter, remove sprite flicker |
+| NES palette | Saturation and hue shift |
 
-### The "2026" renderer
-Because it works from the PPU's colour layers rather than a finished bitmap, the remastered
-mode can treat background and sprites as separate surfaces:
+**How the remastered renderer works:** the PPU exports separate colour layers (background,
+sprites with priority, backdrop per scanline) rather than only a finished bitmap. Metal compute
+shaders rebuild each layer at high resolution: a Gaussian coverage field with anti-aliased
+thresholding turns stair-steps into clean diagonals and curves, and a B-spline height field supplies
+the lighting normals. The scene pass composites the layers with shadows over a procedural
+underwater backdrop. A 6-level bloom chain and a filmic composite finish the image.
 
-* **Reconstruction**: each output texel builds a Gaussian coverage field from the surrounding
-  NES pixels and thresholds it with anti-aliasing. Staircases turn into clean diagonals and
-  curves, flat colour regions stay crisp, and it works at any resolution (up to 8× internal).
-* **Surface lighting**: a B-spline-smoothed height field gives every shape a bevelled,
-  glossy look (diffuse + specular + rim light), with an adjustable light direction.
-* **Soft shadows**: sprites cast shadows on the playfield; walls cast shadows on the backdrop.
-* **Animated deep-sea backdrop**: caustics, light shafts and rising bubbles replace the flat
-  backdrop colour, tinted by whatever colour the game sets.
-* **HDR post**: bloom (soft-knee threshold, 6-level dual filter), ACES tonemapping, exposure,
-  saturation and contrast, vignette, chromatic aberration, film grain.
-* **Ambient border**: pillarbox bars glow with a blurred version of the picture.
-* Also included: **Classic** (sharp anti-aliased pixels, optional integer scaling) and **CRT**
-  (beam-width scanlines, aperture grille, curvature) modes, 4:3 NTSC or square pixels,
-  overscan crop, NES palette hue and saturation, and a "no sprite flicker" option.
+### Audio
+| Option | |
+|---|---|
+| Sound & music | **Original (NES 2A03)** or **Remastered 2026** |
+| Remastered | Lead instruments (Clean / Warm Analog / Supersaw), reverb, stereo width, bass |
+| Output | Volume, mute, mute when in background |
+| Channels | Pulse 1, Pulse 2, Triangle, Noise and DPCM can each be switched on or off |
 
-### Remastered 2026 sound & music
-Settings › Audio › **Sound & music** switches between:
+**How the remastered sound works:** the original music driver still runs. A synth reads the
+sound chip's registers every sample and plays the same notes with band-limited (PolyBLEP)
+oscillators and resonant filters. Leads are spread in stereo with chorus, the triangle becomes a warm
+bass with a sub-octave, and noise becomes filtered drums. A Freeverb-style hall reverb and a soft
+limiter finish the mix, which is level-matched to the original.
 
-* **Original (NES 2A03)**: the authentic, cycle-accurate sound chip.
-* **Remastered 2026**: the same music and effects, performed live by a modern synth that reads the
-  sound chip's registers every sample. You get band-limited lead instruments (Clean, Warm Analog or
-  Supersaw), a warm bass with a sub-octave, filtered drums, smoothed envelopes without zipper noise,
-  stereo placement with chorus, a hall reverb and a soft limiter. You can adjust reverb, stereo width and bass,
-  and each channel can still be muted on its own. Both modes are level-matched.
-
-Presets are in **Game › Graphics Preset**: Remastered Ultra, Remastered Light, Classic, CRT.
-
-## Default controls
+### Controls
+Every binding can be changed. Click a slot, then press a key or controller button (Esc cancels).
+Xbox, PlayStation, Switch Pro and MFi controllers are supported, and you can set the stick dead
+zone and turbo rate.
 
 | NES | Player 1 | Player 2 | Gamepad |
 |---|---|---|---|
@@ -71,11 +96,62 @@ Presets are in **Game › Graphics Preset**: Remastered Ultra, Remastered Light,
 | Start | Return | Y | Menu |
 | Select | Right Shift | T | Options |
 
-Shortcuts: **P** pause, **Tab** (hold) fast-forward, **F5** quick save, **F7** quick load,
-**F2** reset. These also have menu equivalents: ⌘P, ⌘S, ⌘L, ⌘R. All of them can be rebound in Settings › Controls.
+| Shortcut | Key | Menu |
+|---|---|---|
+| Pause / resume | P | ⌘P |
+| Fast-forward (hold) | Tab | |
+| Quick save / load | F5 / F7 | ⌘S / ⌘L |
+| Reset | F2 | ⌘R |
+| Open ROM | | ⌘O |
 
-## Notes
-* Only mapper-0 (NROM) ROMs are supported. That covers Clu Clu Land and other early titles.
-* Save states live in `~/Library/Application Support/Clu Clu Land Remastered/States/`.
-* `Tools/headless.c` is a command-line test runner for the core:
-  `cc -O2 -ISources/NESCore/include Sources/NESCore/nescore.c Tools/headless.c -o headless -lm`
+## Project structure
+
+```
+Package.swift                     Swift package (macOS 13+)
+build_app.sh                      builds and assembles "Clu Clu Land Remastered.app"
+Sources/NESCore/                  C core: 6502 CPU, PPU + layer export, APU + remastered synth,
+                                  NROM mapper, controllers, save states
+Sources/CluCluLandRemastered/
+  App.swift                       app, menus
+  GameView.swift                  MTKView host, overlays, drag & drop
+  Renderer.swift                  Metal pipeline
+  Shaders.swift                   Metal shaders (compiled at launch)
+  GameSession.swift               frame pacing, audio rate control, save states, hotkeys
+  Emulator.swift / Audio.swift    core wrapper / AVAudioEngine stereo output
+  Input.swift                     keyboard + game controllers, rebinding
+  Settings.swift / SettingsView.swift
+Resources/                        Info.plist, AppIcon.png, IconAlternates/
+Tools/headless.c                  command-line test runner for the core
+Tools/make_icon.py                procedural renderer for the app icon
+```
+
+## App icon
+
+The icon is original artwork rendered by `Tools/make_icon.py`. `Resources/AppIcon.png` (purple
+"Twilight") is the active icon, and `build_app.sh` converts it to `AppIcon.icns`. A teal "Deep Sea"
+variant is in `Resources/IconAlternates/`. To switch, copy it over `Resources/AppIcon.png` and rebuild.
+
+## Troubleshooting
+
+* **Icon doesn't show after a rebuild**: macOS caches icons per path. The build script
+  re-registers the app, but if Finder still shows a blank icon, run `killall Dock Finder`.
+* **"Unsupported mapper"**: only mapper-0 (NROM) ROMs are supported. That covers Clu Clu Land.
+* **No sound**: check Settings › Audio (mute, *mute when in background*, channel switches).
+* **Opening the app on another Mac**: the bundle is only ad-hoc signed. If macOS blocks it,
+  right-click the app and choose **Open**, or run `xattr -dr com.apple.quarantine "Clu Clu Land Remastered.app"`.
+* **Black window or crash at launch**: run the binary from Terminal to see the log:
+  `"build/Clu Clu Land Remastered.app/Contents/MacOS/CluCluLandRemastered"`. Metal shader compile
+  errors are printed there.
+
+## Development
+
+Test the core headlessly. This runs N frames with scripted input and writes PPM frames and layer
+dumps to `out/` every K frames:
+
+```bash
+cc -O2 -ISources/NESCore/include Sources/NESCore/nescore.c Tools/headless.c -o headless -lm
+mkdir -p out && ./headless "../Clu Clu Land.nes" 1500 "start@200-206,right@700-900,a@750-760" 100
+```
+
+Save states are stored in `~/Library/Application Support/Clu Clu Land Remastered/States/`.
+Settings are stored in the app's `UserDefaults`.
