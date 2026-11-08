@@ -102,6 +102,8 @@ final class GameSession: ObservableObject {
         let a = SettingsStore.shared.audio
         nes_set_unlimited_sprites(nes, g.unlimitedSprites ? 1 : 0)
         nes_set_channel_mask(nes, a.channelMask)
+        nes_set_audio_mode(nes, a.soundMode == .remastered ? 1 : 0)
+        nes_set_remaster_audio(nes, Float(a.reverb), Float(a.stereoWidth), Float(a.bass), a.leadTone.code)
 
         var frames = 0
         if abs(dt - Self.frameTime) < 0.0025 {

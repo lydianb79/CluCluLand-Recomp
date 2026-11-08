@@ -48,6 +48,16 @@ mode can treat background and sprites as separate surfaces:
   (beam-width scanlines, aperture grille, curvature) modes, 4:3 NTSC or square pixels,
   overscan crop, NES palette hue and saturation, and a "no sprite flicker" option.
 
+### Remastered 2026 sound & music
+Settings › Audio › **Sound & music** switches between:
+
+* **Original (NES 2A03)**: the authentic, cycle-accurate sound chip.
+* **Remastered 2026**: the same music and effects, performed live by a modern synth that reads the
+  sound chip's registers every sample. You get band-limited lead instruments (Clean, Warm Analog or
+  Supersaw), a warm bass with a sub-octave, filtered drums, smoothed envelopes without zipper noise,
+  stereo placement with chorus, a hall reverb and a soft limiter. You can adjust reverb, stereo width and bass,
+  and each channel can still be muted on its own. Both modes are level-matched.
+
 Presets are in **Game › Graphics Preset**: Remastered Ultra, Remastered Light, Classic, CRT.
 
 ## Default controls

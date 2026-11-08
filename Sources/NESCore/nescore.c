@@ -92,7 +92,37 @@ typedef struct {
     uint8_t buttons[2];
 } Machine;
 
-#define RING 16384
+
+// ---------------------------------------------------------------------------
+// "Remastered" audio: state for re-synthesising the APU channels
+// ---------------------------------------------------------------------------
+typedef struct { float ic1, ic2; } SVF;
+typedef struct { float lp, bp, hp; } SVFOut;
+
+#define ENH_COMB_MAX 3400
+#define ENH_AP_MAX 1400
+#define ENH_CHORUS 4096
+typedef struct {
+    float ph[3];           // oscillator phases
+    float freq_s, amp_s;   // smoothed frequency / amplitude
+    SVF f;
+} EnhVoice;
+
+typedef struct {
+    EnhVoice p[2];
+    float tri_ph, tri_sub_ph, tri_freq_s, tri_amp_s;
+    float noise_amp_s, noise_hold, noise_ph;
+    uint32_t rng;
+    SVF nlp, nhp;
+    float dmc_prev_in, dmc_hp;
+    float chorus[ENH_CHORUS]; int chorus_w; float lfo;
+    float comb[8][ENH_COMB_MAX]; int comb_len[8], comb_idx[8]; float comb_filt[8];
+    float ap[4][ENH_AP_MAX]; int ap_len[4], ap_idx[4];
+    float dcl_in, dcl_out, dcr_in, dcr_out;
+    double configured_rate;
+} Enh;
+
+#define RING 16384 // stereo frames
 struct NES {
     Machine m;
     // cartridge
@@ -103,6 +133,9 @@ struct NES {
     int unlimited_sprites;
     uint32_t chan_mask;
     int audio_enabled;
+    int audio_mode; // 0 original, 1 remastered
+    float enh_reverb, enh_width, enh_bass; int enh_tone;
+    Enh enh;
     double sample_rate, rate_adjust;
     float palette_rgb[192];
     uint32_t palette_rgba[64];
@@ -112,7 +145,7 @@ struct NES {
     uint8_t layer_spr[NES_W * NES_H];
     uint8_t layer_bd[NES_H];
     // audio ring buffer (single producer: emulation thread, single consumer: audio thread)
-    float ring[RING];
+    float ring[RING * 2];
     _Atomic uint32_t ring_w, ring_r;
 };
 
@@ -804,13 +837,234 @@ static uint8_t apu_read_status(NES* n) {
     return r;
 }
 
-static void ring_push(NES* n, float s) {
+static void ring_push(NES* n, float l, float r) {
     if (!n->audio_enabled) return;
     uint32_t w = atomic_load_explicit(&n->ring_w, memory_order_relaxed);
-    uint32_t r = atomic_load_explicit(&n->ring_r, memory_order_acquire);
-    if (w - r >= RING) return; // full: drop
-    n->ring[w % RING] = s;
+    uint32_t rd = atomic_load_explicit(&n->ring_r, memory_order_acquire);
+    if (w - rd >= RING) return; // full: drop
+    n->ring[(w % RING) * 2] = l;
+    n->ring[(w % RING) * 2 + 1] = r;
     atomic_store_explicit(&n->ring_w, w + 1, memory_order_release);
+}
+
+// --- remastered synth helpers ----------------------------------------------
+static inline SVFOut svf_run(SVF* f, float x, float cutoff, float q, float sr) {
+    float fc = cutoff < sr * 0.45f ? cutoff : sr * 0.45f;
+    float g = tanf((float)M_PI * fc / sr), k = 1.0f / q;
+    float a1 = 1.0f / (1.0f + g * (g + k)), a2 = g * a1, a3 = g * a2;
+    float v3 = x - f->ic2;
+    float v1 = a1 * f->ic1 + a2 * v3;
+    float v2 = f->ic2 + a2 * f->ic1 + a3 * v3;
+    f->ic1 = 2.0f * v1 - f->ic1;
+    f->ic2 = 2.0f * v2 - f->ic2;
+    SVFOut o = { v2, v1, x - k * v1 - v2 };
+    return o;
+}
+static inline float polyblep(float t, float dt) {
+    if (dt <= 0.0f) return 0.0f;
+    if (t < dt) { t /= dt; return t + t - t * t - 1.0f; }
+    if (t > 1.0f - dt) { t = (t - 1.0f) / dt; return t * t + t + t + 1.0f; }
+    return 0.0f;
+}
+static inline float osc_saw(float t, float dt) { return 2.0f * t - 1.0f - polyblep(t, dt); }
+static inline float osc_pulse(float t, float dt, float duty) {
+    float v = t < duty ? 1.0f : -1.0f;
+    v += polyblep(t, dt);
+    float t2 = t + 1.0f - duty; if (t2 >= 1.0f) t2 -= 1.0f;
+    v -= polyblep(t2, dt);
+    return v - (2.0f * duty - 1.0f); // remove DC of asymmetric duty
+}
+static inline float wrap1(float x) { return x - floorf(x); }
+static inline float soft_clip(float x) {
+    if (x > 3.0f) return 1.0f;
+    if (x < -3.0f) return -1.0f;
+    return x * (27.0f + x * x) / (27.0f + 9.0f * x * x);
+}
+
+static void enh_configure(NES* n) {
+    Enh* e = &n->enh;
+    double sr = n->sample_rate;
+    static const int comb_base[8] = {1116, 1188, 1277, 1356, 1139, 1211, 1300, 1379};
+    static const int ap_base[4] = {556, 441, 579, 464};
+    for (int i = 0; i < 8; i++) {
+        int len = (int)(comb_base[i] * sr / 44100.0);
+        e->comb_len[i] = len < ENH_COMB_MAX ? len : ENH_COMB_MAX;
+        e->comb_idx[i] = 0; e->comb_filt[i] = 0;
+        memset(e->comb[i], 0, sizeof(e->comb[i]));
+    }
+    for (int i = 0; i < 4; i++) {
+        int len = (int)(ap_base[i] * sr / 44100.0);
+        e->ap_len[i] = len < ENH_AP_MAX ? len : ENH_AP_MAX;
+        e->ap_idx[i] = 0;
+        memset(e->ap[i], 0, sizeof(e->ap[i]));
+    }
+    memset(e->chorus, 0, sizeof(e->chorus));
+    e->chorus_w = 0;
+    if (!e->rng) e->rng = 0x12345678u;
+    e->configured_rate = sr;
+}
+
+static inline float chorus_tap(const Enh* e, float delay_samples) {
+    float pos = (float)e->chorus_w - delay_samples;
+    while (pos < 0) pos += ENH_CHORUS;
+    int i0 = (int)pos; float fr = pos - (float)i0;
+    float a = e->chorus[i0 % ENH_CHORUS], b = e->chorus[(i0 + 1) % ENH_CHORUS];
+    return a + (b - a) * fr;
+}
+
+// Builds one stereo sample by reading the live APU registers and playing them with new instruments.
+static void enh_sample(NES* n, float* outL, float* outR) {
+    Enh* e = &n->enh;
+    APU* a = &n->m.apu;
+    float sr = (float)n->sample_rate;
+    if (e->configured_rate != n->sample_rate) enh_configure(n);
+    uint32_t mask = n->chan_mask;
+    float width = n->enh_width;
+    float L = 0, R = 0;
+    const float ka = 1.0f - expf(-1.0f / (0.004f * sr));  // amplitude smoothing (removes envelope zipper)
+    const float kf = 1.0f - expf(-1.0f / (0.0015f * sr)); // tiny glide on pitch changes
+    static const float duty_tab[4] = {0.125f, 0.25f, 0.5f, 0.75f};
+
+    // --- leads (pulse 1 & 2) ---
+    float lead_mono = 0;
+    for (int i = 0; i < 2; i++) {
+        Pulse* p = i ? &a->p2 : &a->p1;
+        EnhVoice* v = &e->p[i];
+        int on = (mask & (1u << i)) && p->enabled && p->length > 0 && p->timer_period >= 8 && sweep_target(p) <= 0x7FF;
+        float vol = on ? (float)(p->const_vol ? p->vol : p->env_decay) / 15.0f : 0.0f;
+        float f = (float)(CPU_HZ / (16.0 * (p->timer_period + 1)));
+        if (v->amp_s < 0.002f) v->freq_s = f; else v->freq_s += (f - v->freq_s) * kf;
+        v->amp_s += (vol - v->amp_s) * ka;
+        if (v->amp_s < 1e-5f && vol == 0.0f) { v->amp_s = 0; continue; }
+        float dt = v->freq_s / sr, duty = duty_tab[p->duty & 3];
+        float osc, cutoff;
+        switch (n->enh_tone) {
+        case 0: // clean: band-limited original waveform
+            osc = osc_pulse(v->ph[0], dt, duty);
+            cutoff = 16000.0f;
+            break;
+        case 2: { // supersaw
+            float dt1 = dt * 1.0059f, dt2 = dt * 0.9942f;
+            osc = (osc_saw(v->ph[0], dt) + osc_saw(v->ph[1], dt1) + osc_saw(v->ph[2], dt2)) * 0.36f
+                + osc_pulse(v->ph[0], dt, duty) * 0.25f;
+            v->ph[1] = wrap1(v->ph[1] + dt1); v->ph[2] = wrap1(v->ph[2] + dt2);
+            cutoff = v->freq_s * 10.0f + 1800.0f;
+            break;
+        }
+        default: { // warm analog
+            float dt1 = dt * 1.0035f;
+            osc = osc_pulse(v->ph[0], dt, duty) * 0.65f + osc_saw(v->ph[1], dt1) * 0.35f;
+            v->ph[1] = wrap1(v->ph[1] + dt1);
+            cutoff = v->freq_s * 5.0f + 900.0f;
+            break;
+        }
+        }
+        v->ph[0] = wrap1(v->ph[0] + dt);
+        float s = svf_run(&v->f, osc, cutoff > 12000.0f ? 12000.0f : cutoff, 0.8f, sr).lp;
+        s *= v->amp_s * 0.20f;
+        float pan = (i ? 0.38f : -0.38f) * width;            // -1..1
+        float ang = (pan + 1.0f) * (float)M_PI * 0.25f;
+        L += s * cosf(ang) * 1.4142f; R += s * sinf(ang) * 1.4142f;
+        lead_mono += s;
+    }
+
+    // stereo chorus on the leads
+    e->chorus[e->chorus_w] = lead_mono;
+    e->lfo += 0.55f / sr; if (e->lfo >= 1.0f) e->lfo -= 1.0f;
+    float lfo = sinf(e->lfo * 2.0f * (float)M_PI);
+    float base = 0.013f * sr, depth = 0.0025f * sr;
+    float chL = chorus_tap(e, base + depth * lfo);
+    float chR = chorus_tap(e, base - depth * lfo);
+    e->chorus_w = (e->chorus_w + 1) % ENH_CHORUS;
+    L += chL * 0.45f * width; R += chR * 0.45f * width;
+
+    // --- bass (triangle) ---
+    {
+        Triangle* t = &a->tri;
+        int on = (mask & 4) && t->enabled && t->length && t->linear && t->timer_period >= 2;
+        float f = (float)(CPU_HZ / (32.0 * (t->timer_period + 1)));
+        if (e->tri_amp_s < 0.002f) e->tri_freq_s = f; else e->tri_freq_s += (f - e->tri_freq_s) * kf;
+        e->tri_amp_s += ((on ? 1.0f : 0.0f) - e->tri_amp_s) * ka;
+        if (e->tri_amp_s > 1e-5f) {
+            float dt = e->tri_freq_s / sr;
+            float ph = e->tri_ph;
+            float tri = 4.0f * fabsf(ph - 0.5f) - 1.0f;
+            float sine = sinf(ph * 2.0f * (float)M_PI);
+            float sub = sinf(e->tri_sub_ph * 2.0f * (float)M_PI);
+            float x = sine * 0.7f + tri * 0.3f + sub * 0.45f * n->enh_bass;
+            x = soft_clip(x * (1.0f + 0.6f * n->enh_bass)) ;
+            float s = x * e->tri_amp_s * 0.30f;
+            L += s; R += s;
+            e->tri_ph = wrap1(ph + dt);
+            e->tri_sub_ph = wrap1(e->tri_sub_ph + dt * 0.5f);
+        }
+    }
+
+    // --- drums / effects (noise) ---
+    {
+        Noise* z = &a->noise;
+        int on = (mask & 8) && z->enabled && z->length;
+        float vol = on ? (float)(z->const_vol ? z->vol : z->env_decay) / 15.0f : 0.0f;
+        e->noise_amp_s += (vol - e->noise_amp_s) * (1.0f - expf(-1.0f / (0.0008f * sr)));
+        if (e->noise_amp_s > 1e-5f) {
+            float rate = (float)(CPU_HZ / (2.0 * (z->timer_period ? z->timer_period : 4)));
+            float src;
+            if (z->mode) {
+                src = (z->lfsr & 1) ? -1.0f : 1.0f; // metallic/tonal mode: keep the console's sequence
+            } else {
+                e->rng ^= e->rng << 13; e->rng ^= e->rng >> 17; e->rng ^= e->rng << 5;
+                src = (float)(e->rng & 0xFFFF) / 32768.0f - 1.0f;
+            }
+            float lpc = rate * 0.5f; if (lpc < 400.0f) lpc = 400.0f;
+            float x = svf_run(&e->nlp, src, lpc, 0.9f, sr).lp;
+            x = svf_run(&e->nhp, x, 160.0f, 0.7f, sr).hp;
+            float s = x * e->noise_amp_s * 0.20f;
+            float pan = 0.15f * width;
+            L += s * (1.0f - pan); R += s * (1.0f + pan);
+        }
+    }
+
+    // --- DPCM samples ---
+    if (mask & 16) {
+        float d = (float)a->dmc.output / 127.0f;
+        float k = expf(-2.0f * (float)M_PI * 20.0f / sr);
+        e->dmc_hp = k * (e->dmc_hp + d - e->dmc_prev_in); e->dmc_prev_in = d;
+        L += e->dmc_hp * 0.45f; R += e->dmc_hp * 0.45f;
+    }
+
+    // --- reverb (Freeverb-style: 4 combs + 2 allpasses per side) ---
+    float rv = n->enh_reverb;
+    if (rv > 0.001f) {
+        float in = (L + R) * 0.5f * 0.03f;
+        float room = 0.80f + 0.06f * rv, damp = 0.35f;
+        float wl = 0, wr = 0;
+        for (int c = 0; c < 8; c++) {
+            float o = e->comb[c][e->comb_idx[c]];
+            e->comb_filt[c] = o * (1.0f - damp) + e->comb_filt[c] * damp;
+            e->comb[c][e->comb_idx[c]] = in + e->comb_filt[c] * room;
+            if (++e->comb_idx[c] >= e->comb_len[c]) e->comb_idx[c] = 0;
+            if (c < 4) wl += o; else wr += o;
+        }
+        for (int k2 = 0; k2 < 4; k2++) {
+            float* x = k2 < 2 ? &wl : &wr;
+            float bo = e->ap[k2][e->ap_idx[k2]];
+            float o = -*x + bo;
+            e->ap[k2][e->ap_idx[k2]] = *x + bo * 0.5f;
+            if (++e->ap_idx[k2] >= e->ap_len[k2]) e->ap_idx[k2] = 0;
+            *x = o;
+        }
+        float wet = rv * 2.2f;
+        float mid = (wl + wr) * 0.5f, side = (wl - wr) * 0.5f * (0.5f + width);
+        L += (mid + side) * wet; R += (mid - side) * wet;
+    }
+
+    // --- DC block + soft limiter ---
+    float kdc = 1.0f - 2.0f * (float)M_PI * 10.0f / sr;
+    float yl = L - e->dcl_in + kdc * e->dcl_out; e->dcl_in = L; e->dcl_out = yl;
+    float yr = R - e->dcr_in + kdc * e->dcr_out; e->dcr_in = R; e->dcr_out = yr;
+    // level-matched to the original mix (~same loudness when switching modes)
+    *outL = soft_clip(yl * 0.6f) * 0.85f;
+    *outR = soft_clip(yr * 0.6f) * 0.85f;
 }
 
 static void apu_step(NES* n, int cycles) {
@@ -899,7 +1153,14 @@ static void apu_step(NES* n, int cycles) {
             double h1 = k1 * (a->hp1_prev_out + s - a->hp1_prev_in); a->hp1_prev_in = s; a->hp1_prev_out = h1;
             double h2 = k2 * (a->hp2_prev_out + h1 - a->hp2_prev_in); a->hp2_prev_in = h1; a->hp2_prev_out = h2;
             a->lp_prev += (h2 - a->lp_prev) * lpk;
-            ring_push(n, (float)(a->lp_prev * 1.6));
+            if (n->audio_mode == 1) {
+                float l, r;
+                enh_sample(n, &l, &r);
+                ring_push(n, l, r);
+            } else {
+                float m = (float)(a->lp_prev * 1.6);
+                ring_push(n, m, m);
+            }
         }
     }
     n->m.cpu.irq_line = a->fc_irq || a->dmc.irq_flag;
@@ -929,6 +1190,7 @@ NES* nes_create(const uint8_t* rom, size_t len, char* err, int errlen) {
     n->vertical_mirror = rom[6] & 1;
     n->chan_mask = 0x1F;
     n->audio_enabled = 1;
+    n->enh_reverb = 0.35f; n->enh_width = 0.7f; n->enh_bass = 0.4f; n->enh_tone = 1;
     n->sample_rate = 48000.0; n->rate_adjust = 1.0;
     float pal[192];
     nes_build_palette(pal, 1.0f, 0.0f, 1.0f, 0.0f, 2.2f);
@@ -990,13 +1252,24 @@ void nes_set_audio_enabled(NES* n, int e) { n->audio_enabled = e ? 1 : 0; }
 int nes_audio_available(NES* n) {
     return (int)(atomic_load_explicit(&n->ring_w, memory_order_acquire) - atomic_load_explicit(&n->ring_r, memory_order_relaxed));
 }
-int nes_audio_read(NES* n, float* out, int max) {
+int nes_audio_read(NES* n, float* out, int max_frames) {
     uint32_t r = atomic_load_explicit(&n->ring_r, memory_order_relaxed);
     uint32_t w = atomic_load_explicit(&n->ring_w, memory_order_acquire);
-    int avail = (int)(w - r), cnt = avail < max ? avail : max;
-    for (int i = 0; i < cnt; i++) out[i] = n->ring[(r + (uint32_t)i) % RING];
+    int avail = (int)(w - r), cnt = avail < max_frames ? avail : max_frames;
+    for (int i = 0; i < cnt; i++) {
+        uint32_t idx = (r + (uint32_t)i) % RING;
+        out[i * 2] = n->ring[idx * 2];
+        out[i * 2 + 1] = n->ring[idx * 2 + 1];
+    }
     atomic_store_explicit(&n->ring_r, r + (uint32_t)cnt, memory_order_release);
     return cnt;
+}
+void nes_set_audio_mode(NES* n, int mode) { n->audio_mode = mode == 1 ? 1 : 0; }
+void nes_set_remaster_audio(NES* n, float reverb, float width, float bass, int tone) {
+    n->enh_reverb = reverb < 0 ? 0 : (reverb > 1 ? 1 : reverb);
+    n->enh_width = width < 0 ? 0 : (width > 1 ? 1 : width);
+    n->enh_bass = bass < 0 ? 0 : (bass > 1 ? 1 : bass);
+    n->enh_tone = tone < 0 ? 0 : (tone > 2 ? 2 : tone);
 }
 
 #define STATE_MAGIC 0x434C5531u // "CLU1"

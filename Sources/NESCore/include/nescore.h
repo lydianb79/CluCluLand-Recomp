@@ -51,16 +51,21 @@ const uint8_t*  nes_layer_spr(const NES* nes);
 // 240 entries, NES colour of the backdrop on each scanline.
 const uint8_t*  nes_layer_backdrop(const NES* nes);
 
-// Audio. Samples are mono float32, produced while frames run.
+// Audio. Interleaved stereo float32 frames (L, R), produced while frames run.
 void  nes_set_sample_rate(NES* nes, double rate);
 // Fine rate adjust (1.0 = nominal). Used for dynamic rate control against the audio clock.
 void  nes_set_rate_adjust(NES* nes, double ratio);
-// Thread-safe single-consumer read. Returns number of samples written.
-int   nes_audio_read(NES* nes, float* out, int max);
-int   nes_audio_available(NES* nes);
+// Thread-safe single-consumer read into out[2*max_frames]. Returns number of frames written.
+int   nes_audio_read(NES* nes, float* out, int max_frames);
+int   nes_audio_available(NES* nes); // frames queued
 void  nes_set_channel_mask(NES* nes, uint32_t mask); // bit0..4 = pulse1,pulse2,tri,noise,dmc
 // When disabled no samples are queued (used while fast-forwarding).
 void  nes_set_audio_enabled(NES* nes, int enabled);
+// 0 = original 2A03 sound, 1 = "Remastered": the same music re-performed live from the APU
+// registers with band-limited instruments, stereo chorus and reverb.
+void  nes_set_audio_mode(NES* nes, int mode);
+// Remastered parameters: reverb 0..1, stereo width 0..1, bass 0..1, lead tone 0 clean / 1 warm / 2 supersaw.
+void  nes_set_remaster_audio(NES* nes, float reverb, float width, float bass, int tone);
 
 // Save states (fixed-size blob).
 size_t nes_state_size(void);

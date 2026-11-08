@@ -8,31 +8,49 @@ final class AudioOutput {
     private(set) var sampleRate: Double = 48000
     private var configObserver: NSObjectProtocol?
 
+    /// `pull` fills interleaved stereo frames (L, R) and returns how many frames it wrote.
     init(pull: @escaping (UnsafeMutablePointer<Float>, Int) -> Int) {
         let hwFormat = engine.outputNode.outputFormat(forBus: 0)
         sampleRate = hwFormat.sampleRate > 8000 ? hwFormat.sampleRate : 48000
-        guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1) else { return }
+        // standard format = deinterleaved float32, one buffer per channel
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2) else { return }
 
-        // boxed so the (possibly @Sendable) render block never mutates a captured `var`
-        final class FadeState { var last: Float = 0 }
-        let fade = FadeState()
+        // boxed so the (possibly @Sendable) render block never mutates a captured `var`;
+        // the scratch buffer is allocated once, never on the audio thread
+        final class RenderState {
+            var lastL: Float = 0, lastR: Float = 0
+            let chunk = 2048
+            let scratch: UnsafeMutablePointer<Float>
+            init() { scratch = .allocate(capacity: 2048 * 2); scratch.initialize(repeating: 0, count: 2048 * 2) }
+            deinit { scratch.deallocate() }
+        }
+        let state = RenderState()
         let node = AVAudioSourceNode(format: format) { _, _, frameCount, audioBufferList -> OSStatus in
-            var last = fade.last
-            defer { fade.last = last }
             let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
-            guard buffers.count > 0, let mData = buffers[0].mData else { return noErr }
-            let out = mData.assumingMemoryBound(to: Float.self)
-            let n = Int(frameCount)
-            let got = pull(out, n)
-            if got > 0 { last = out[got - 1] }
-            if got < n {
-                // underrun: fade the last sample out instead of clicking
-                for i in got..<n { last *= 0.995; out[i] = last }
-            }
-            if buffers.count > 1 {
-                for b in 1..<buffers.count {
-                    if let d = buffers[b].mData { memcpy(d, mData, n * MemoryLayout<Float>.size) }
+            guard buffers.count > 0, let d0 = buffers[0].mData else { return noErr }
+            let outL = d0.assumingMemoryBound(to: Float.self)
+            let outR = (buffers.count > 1 ? buffers[1].mData : nil)?.assumingMemoryBound(to: Float.self)
+            let total = Int(frameCount)
+            var done = 0
+            var starved = false
+            while done < total {
+                let want = min(state.chunk, total - done)
+                let got = starved ? 0 : pull(state.scratch, want)
+                for i in 0..<got {
+                    outL[done + i] = state.scratch[2 * i]
+                    outR?[done + i] = state.scratch[2 * i + 1]
                 }
+                if got > 0 { state.lastL = state.scratch[2 * (got - 1)]; state.lastR = state.scratch[2 * (got - 1) + 1] }
+                if got < want {
+                    // underrun: fade out instead of clicking
+                    starved = true
+                    for i in got..<want {
+                        state.lastL *= 0.995; state.lastR *= 0.995
+                        outL[done + i] = state.lastL
+                        outR?[done + i] = state.lastR
+                    }
+                }
+                done += want
             }
             return noErr
         }

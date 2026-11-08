@@ -238,6 +238,27 @@ struct AudioSettingsView: View {
 
     var body: some View {
         Form {
+            Section {
+                Picker("Sound & music", selection: $store.audio.soundMode) {
+                    ForEach(SoundMode.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+            } footer: {
+                Text(store.audio.soundMode == .remastered
+                     ? "The original music and effects, performed live with new instruments, stereo chorus and reverb."
+                     : "The authentic sound of the NES sound chip.")
+                    .foregroundStyle(.secondary)
+            }
+            if store.audio.soundMode == .remastered {
+                Section("Remastered sound") {
+                    Picker("Lead instruments", selection: $store.audio.leadTone) {
+                        ForEach(LeadTone.allCases) { Text($0.title).tag($0) }
+                    }
+                    SliderRow(title: "Reverb", value: $store.audio.reverb, range: 0...1)
+                    SliderRow(title: "Stereo width", value: $store.audio.stereoWidth, range: 0...1)
+                    SliderRow(title: "Bass", value: $store.audio.bass, range: 0...1)
+                }
+            }
             Section("Output") {
                 HStack {
                     Text("Volume").frame(width: 170, alignment: .leading)

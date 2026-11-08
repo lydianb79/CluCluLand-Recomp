@@ -19,7 +19,7 @@ int main(int argc,char**argv){
     if(!strcmp(name,"up"))btn|=NES_BTN_UP;if(!strcmp(name,"down"))btn|=NES_BTN_DOWN;if(!strcmp(name,"left"))btn|=NES_BTN_LEFT;if(!strcmp(name,"right"))btn|=NES_BTN_RIGHT;}}
   nes_set_buttons(n,0,btn);
   nes_run_frame(n);
-  int got; while((got=nes_audio_read(n,tmp,4096))>0){samples+=got;for(int j=0;j<got;j++)sumsq+=tmp[j]*tmp[j];}
+  int got; while((got=nes_audio_read(n,tmp,2048))>0){samples+=got;for(int j=0;j<got*2;j++)sumsq+=tmp[j]*tmp[j]/2;}
   if(argc>4 && (i+1)%atoi(argv[4])==0){char p[64];sprintf(p,"out/f%05d.ppm",i+1);dump(p,nes_framebuffer(n));
     char q[64];sprintf(q,"out/l%05d.bin",i+1);FILE*g=fopen(q,"wb");fwrite(nes_layer_bg(n),1,256*240,g);fwrite(nes_layer_spr(n),1,256*240,g);fwrite(nes_layer_backdrop(n),1,240,g);fclose(g);}
  }

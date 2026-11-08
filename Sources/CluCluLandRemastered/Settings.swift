@@ -132,7 +132,37 @@ enum GraphicsPreset: String, CaseIterable, Identifiable {
 
 // MARK: - Audio
 
+enum SoundMode: String, Codable, CaseIterable, Identifiable {
+    case original, remastered
+    var id: String { rawValue }
+    var title: String { self == .original ? "Original (NES 2A03)" : "Remastered 2026" }
+}
+
+enum LeadTone: String, Codable, CaseIterable, Identifiable {
+    case clean, warm, supersaw
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .clean: return "Clean (hi-fi original)"
+        case .warm: return "Warm Analog"
+        case .supersaw: return "Supersaw"
+        }
+    }
+    var code: Int32 {
+        switch self {
+        case .clean: return 0
+        case .warm: return 1
+        case .supersaw: return 2
+        }
+    }
+}
+
 struct AudioSettings: Codable, Equatable {
+    var soundMode: SoundMode = .remastered
+    var leadTone: LeadTone = .warm
+    var reverb: Double = 0.35
+    var stereoWidth: Double = 0.7
+    var bass: Double = 0.4
     var volume: Double = 0.8
     var muted: Bool = false
     var pulse1 = true, pulse2 = true, triangle = true, noise = true, dmc = true
