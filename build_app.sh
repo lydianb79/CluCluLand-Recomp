@@ -22,7 +22,12 @@ cp "$BIN_DIR/CluCluLandRemastered" "$APP/Contents/MacOS/CluCluLandRemastered"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 
 # App icon
-if [[ -f Resources/AppIcon.png ]] && command -v iconutil >/dev/null; then
+if [[ ! -f Resources/AppIcon.png ]]; then
+    echo "  ! Resources/AppIcon.png not found, app will have no icon"
+elif ! command -v iconutil >/dev/null; then
+    echo "  ! iconutil not found (install Xcode Command Line Tools), app will have no icon"
+else
+    echo "▸ Creating AppIcon.icns"
     ICONSET="build/AppIcon.iconset"
     rm -rf "$ICONSET"; mkdir -p "$ICONSET"
     for s in 16 32 128 256 512; do
@@ -39,5 +44,10 @@ for rom in "../Clu Clu Land.nes" "Clu Clu Land.nes"; do
 done
 
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "  (ad-hoc codesign skipped)"
+
+# Refresh Finder/Dock icon caches for this bundle (macOS caches icons per path)
+touch "$APP"
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+[[ -x "$LSREGISTER" ]] && "$LSREGISTER" -f "$APP" >/dev/null 2>&1 || true
 echo "✓ Done: $APP"
 echo "  Run with: open \"$APP\""
